@@ -1,0 +1,297 @@
+// This #include statement was automatically added by the Particle IDE.
+#include <SparkFun_Photon_Weather_Shield_Library.h>
+
+
+// -----------------------------------
+//First Draft of Weather Station 
+//
+// -----------------------------------
+
+//Set up constants 
+#define TICKTIME 5000           //This sets the time between main loop actions
+#define AWAKETIME 15000         //This sets the time the WiFi will stay awake to publish data, listen for commands, flash etc.
+#define SLEEPTIME 292           //Time for Wifi to stay asleep
+#define CALCCOUNT 24            //Number of tick loops for Calculations 24 x 5 = 2 minutes
+#define PUBCOUNT 30             //Number of tick loops for Publishing 24 x 5 = 2 minutes
+#define PRESCOMP 1.0333         //Pressure Compensation for altitude of 286m
+#define PRESCONV 3386.39        //COnvert Pascals to inches of Mercury
+#define BLINKTIME 150           //LED Blink time during sleep
+
+// Set up variables
+int led1 = D7;                  //pin for on board LED to signal Sleep Mode
+int signal = 0;                 //varible to hold the WiFi signal
+double max_temp = 0;          //variable to hold the max temp for the sample period
+double min_temp = 0;             //variable to hold the min temp for the sample period
+double cum_temp = 0;           //variable to hold the averaged WiFi signal
+double avg_temp = 0;
+double humidity = 0;            //Humitidy
+double tempF = 0;
+double baroPress = 0;
+double baroTemp = 0;
+double baroINHg = 0;
+
+// Set up flags for loop control
+bool sleeping = false;          //True if WiFi is sleeping (offline)
+bool sleep_allowed = false;     //True if the WiFi should go to sleep
+bool read_sensors = false;      //True if we should read the sensors
+bool perform_calcs = false;     //True if we should perform the calculations
+bool publish_data = false;      //True if we should publish the data to the cloud
+bool sleep_start = false;       //True if we should put the WiFi to bed
+
+// Counters for loops
+int count = 0;                  //Tick Counter - manily for debug and serial print
+int calc_count = 0;             //Calculation Counter - period between performing calculations
+int publish_count = 0;          //Publish Counter - period between publishing data
+int avg_count = 0;              //number of samples for average calculation
+
+
+// String Variables
+String tempString;            //String to hold the average temp
+//String presString;
+//String data1;
+String debug;
+//String stationID = "KMNMINNE410";
+//String password = "l0ngwall";
+String dateutc = "now";
+
+//Char Variables
+char data[256];
+char id[24] = "KMNMINNE410";
+char pwd[] = "l0ngwall";
+char date[24] = "now";
+//char dateutc[24] = "now";
+
+
+// Set up timers
+Timer tick(TICKTIME, main_loop_timer);  //This is the main loop timer calling funtion main_loop_timer
+Timer awake(AWAKETIME, wifi_sleep);     //This is the awake timer calling function wifi_sleep  
+Timer ledBlink(BLINKTIME, led_off);
+
+//Create Instance of HTU21D or SI7021 temp and humidity sensor and MPL3115A2 barometric sensor
+Weather sensor;
+
+//------------------------------------------------------------------------------------
+// Setup 
+//------------------------------------------------------------------------------------
+void setup()
+{
+    pinMode(led1, OUTPUT);                       //Set up on board led as output
+    Particle.function("SleepMode", sleepMode);   //This function controls wewther the WiFi should be allowed to sleep of not
+    Particle.variable("Sig", signal);            //Expose the raw wifi signal value
+    Particle.variable("Humidity", humidity);     //Expose the humidity variable
+    Particle.variable("TempF", tempF);          //Expose the temperature variable
+    Particle.variable("Pressure", baroPress);   //Expose the pressure variable
+    digitalWrite(led1, LOW);                     //Initialize the onboard LED to off
+    sensor.begin();                              //Initialize the I2C sensors and ping them
+    sensor.setModeBarometer();                   //Set to Barometer Mode
+    sensor.setOversampleRate(7);                 // Set Oversample rate
+    sensor.enableEventFlags();                   //Necessary register calls to enble temp, baro and alt
+    Serial.begin(9600);                          //Begin Serial comms for debugging
+    tick.start();                                //Start the main loop timer
+    WiFi.setCredentials("tncPersonal", "debQ4.17", WEP);
+    
+}
+
+//------------------------------------------------------------------------------------
+//  Main Loop
+//------------------------------------------------------------------------------------
+//The loop is split into sections that are controlled by the loop flags, 
+//which are set true by the tick timer
+//and set false once that section of code runs, waiting for next timer event
+//------------------------------------------------------------------------------------
+void loop()
+{
+    // This section reads the sensors 
+   if ( read_sensors ) 
+   {
+        read_sensors = false;               //Reset the control flag
+//        Serial.println("Reading Signal");   //For debugging
+        signal = WiFi.RSSI();               //get the WiFi signal
+        getWeather();
+        cum_temp = cum_temp + tempF;        //accumulate for average calculation
+        avg_count++;                       //Increment avergage sample counter
+        if ( tempF > max_temp )          //Get the min and max values over the sample period
+        {
+            max_temp = tempF;
+        }
+        if ( tempF < min_temp ) 
+        {
+            min_temp = tempF;
+        }
+        if ( RGB.controlled() )
+        {
+            RGB.color(0, 255, 0);
+            RGB.brightness(32);
+            ledBlink.start();
+        }
+//        Serial.print("Humidity= ");            //For debugging
+//        Serial.println(humidity);
+//        Serial.print("Temp (F)= ");            //For debugging
+//        Serial.println(tempF);
+//        Serial.print("Pressure: ");            //For debugging
+//        Serial.println(baroPress);
+        
+
+   }
+   // This section performs the calculations
+   if ( perform_calcs ) 
+   {
+       perform_calcs = false;                   //Reset the control flag
+       avg_temp = cum_temp / avg_count;      //Calculate the average value 
+       baroINHg = baroPress / PRESCONV;
+//       Serial.print("Average Temp: ");        //For debugging
+//       Serial.println(avg_temp);              //For debugging
+//       Serial.print("Max Temp: ");            //For debugging
+//       Serial.println(max_temp);              //For debugging
+//       Serial.print("Mim Temp: ");            //For debugging
+//       Serial.println(min_temp);              //For debugging
+       tempString = String(avg_temp);         //Convert the average signal (INT) to a string for publishing
+//       presString = String(baroINHg);
+    //Build the date and time of the reading
+        dateutc = Time.format(Time.now(), "%Y-%m-%d+%H:%M:%S");
+        dateutc.replace(":", "%3A");    //HTML escape the : symbol with %3A
+        Serial.print("Date String: ");  //For Debugging
+        Serial.println(dateutc);        //For Debugging
+        debug = dateutc;                //Publish the date string for debugging
+        dateutc.toCharArray(date, sizeof(date));  //copy the string to a char array for use in snprintf
+       cum_temp = 0;                          //Reset the average signal 
+       calc_count = 0;                          //Reset the loop counter for the calculations
+       avg_count = 0;                        //Reset average counter
+   }    
+   // This section publishes the data to the cloud
+   if ( ( publish_data ) && ( WiFi.ready() ) )  //Make sure the WiFi is ready before trying to publish
+   {
+      publish_data = false;                                     //Reset the control flag
+      sleeping = false;                                         //If the WiFI is ready, then it's not sleeping
+      publish_count = 0;                                        //Reset the loop counter
+      RGB.control(false); 
+      build_data();
+//      Serial.println("Wifi Ready, sending data.");              //For debugging  
+//      Particle.publish("WiFi Status","Ready",60,PRIVATE);       //Publish the WiFi Status
+      Particle.publish("TempF",tempString,60,PRIVATE);          //Publish the temperature
+      Particle.publish("Debug",debug,60,PRIVATE);               //Publish debugging information
+      Particle.publish("Wunderground",data,60,PRIVATE);         //Publish the weather data for the webhook
+//      Particle.publish("Date",dateutc,60,PRIVATE);              
+      if ( ( !sleeping ) && ( sleep_allowed ) )                 //Once Publishing is complete, put WiFi to sleep 
+      {
+          
+          Serial.println("call awake timer and sleep");         //For debugging 
+          Serial.println("Awake timer running for flash");      //For debugging 
+          Serial.println(Time.timeStr());                       //For debugging 
+          awake.start();                                        //Start the awake timer. 
+          //This keeps the WiFi alive long enough to allow commands and flash
+      }
+   }
+   // This section triggers sleep mode after the awake timer completes
+   if ( sleep_start )               
+   {
+       sleep_start = false;             //Reset the control flag
+       sleeping = true;                 //Set flag to indicate the WiFi is sleeping
+       RGB.control(true);
+       System.sleep(SLEEPTIME);         //Go To Sleep!    
+   }
+}
+
+//-------------------------------------------------------------------------------------------------
+// Functions
+//-------------------------------------------------------------------------------------------------
+// This function controls weather the WiFI is allowed to go into sleep mode. 
+// It sets the varaible sleep_allowed. If TRUE - sleep is allowed, If FALSE - sleep not allowed 
+// Main purpose for this is to keep the WiFi active so that new firmwared can be flashed easily. 
+int sleepMode(String command) 
+{
+    if (command=="on")              // Command from cloud is on
+    {
+        sleep_allowed = TRUE;       //Set flag to allow WiFi to sleep
+//        digitalWrite(led1,HIGH);    //Turn on LED to indicate sleep mode is allowed
+        Particle.publish("SleepMode","on",60,PRIVATE);  //Publish the sleep mode to the cloud
+        return 1;                   //Return variable for the function
+    } 
+    else if (command=="off")        // Command from cloud is off
+    {
+        sleep_allowed = FALSE;      //Set falg to prevent WiFi from sleeping
+//        digitalWrite(led1,LOW);     //Turn off LED to indicate sleep mode is not allowed
+        Particle.publish("SleepMode","off",60,PRIVATE); //Punlish the sleep mode to the cloud
+        return 0;                   //Return verialble for the function
+    }
+    else 
+    {
+        return -1;                  //command was not valid, return -1 as error condition
+    }
+}
+
+// This function is the main loop timer - keep this short and sweet so as not to block other code
+void main_loop_timer()
+{
+    count++;                            //Loop counter (mainly for debugging)    
+    calc_count++;                       //Loop counter for Calculation Section
+    publish_count++;                    //Loop counter for Pubishing Section
+    Serial.print("Timer Count = ");     //For debugging 
+    Serial.println(count);              //For debugging 
+    Serial.println(Time.timeStr());     //For debugging 
+    read_sensors = true;                //Set the read sensors flag every time through the loop
+    if ( calc_count == CALCCOUNT)       //Set the calcuation flag after CALCCOUNT times
+    {     
+        perform_calcs = true;
+    }
+    if ( publish_count == PUBCOUNT )    //Set the publishing flag after PUNCOUNT times
+    {  
+        publish_data = true;
+    }
+}
+
+// This function is called after the awake timer expires - keep this short and sweet
+void wifi_sleep()
+{
+    sleep_start = true;                         //Set the start_sleep control flag for main loop
+    Serial.println("Awake timer complete");     //For debugging
+    Serial.println(Time.timeStr());             //For debugging
+    awake.stop();                               //Stop the awake timer - restart from main loop
+}
+
+//This function reads the weather sensors-
+void getWeather()
+{
+    // Measure Relative Humidity from the HTU21D or Si7021
+  humidity = sensor.getRH();
+  // Measure Temperature from the HTU21D or Si7021
+  tempF = sensor.getTempF();
+  // Temperature is measured every time RH is requested.
+  // It is faster, therefore, to read it from previous RH
+  // measurement with getTemp() instead with readTemp()
+  //Measure the Barometer temperature in F from the MPL3115A2
+  baroTemp = sensor.readBaroTempF();
+  //Measure Pressure from the MPL3115A2
+  baroPress = sensor.readPressure();
+  baroPress = baroPress * PRESCOMP;    //Adjust for altitude
+}
+void led_off()
+{  
+    if ( RGB.controlled() )
+    {
+    RGB.brightness(0);
+    }
+    ledBlink.stop();
+}
+
+void build_data()
+{
+
+    snprintf(data, sizeof(data),
+         "{\"id\":\"%s\""
+         ",\"pwd\":\"%s\""
+         ",\"dateutc\":\"%s\""
+         ",\"pressure\":\"%4.2f\""
+         ",\"humidity\":\"%3.0f\""
+         ",\"temp\":%4.1f"
+         "}"
+        ,id
+        ,pwd
+        ,date
+        ,baroINHg
+        ,humidity
+        ,avg_temp
+        );
+        Serial.print("Data String: ");
+        Serial.println(data);
+}
