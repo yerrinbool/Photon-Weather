@@ -51,13 +51,13 @@ String tempString;            //String to hold the average temp
 //String data1;
 String debug;
 //String stationID = "KMNMINNE410";
-//String password = "l0ngwall";
+//String password = "########";
 String dateutc = "now";
 
 //Char Variables
 char data[256];
 char id[24] = "KMNMINNE410";
-char pwd[] = "l0ngwall";
+char pwd[] = "########";
 char date[24] = "now";
 //char dateutc[24] = "now";
 
@@ -88,7 +88,6 @@ void setup()
     sensor.enableEventFlags();                   //Necessary register calls to enble temp, baro and alt
     Serial.begin(9600);                          //Begin Serial comms for debugging
     tick.start();                                //Start the main loop timer
-    WiFi.setCredentials("tncPersonal", "debQ4.17", WEP);
     
 }
 
