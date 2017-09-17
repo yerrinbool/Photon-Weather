@@ -1,0 +1,387 @@
+// -----------------------------------
+//First Draft of Weather Station
+//version 4 
+// -----------------------------------
+
+// This #include statement was automatically added by the Particle IDE.
+#include <SparkFun_Photon_Weather_Shield_Library.h>
+
+//Set up constants 
+#define TICKTIME 5000           //This sets the time between main loop actions
+#define AWAKETIME 15000         //This sets the time the WiFi will stay awake to publish data, listen for commands, flash etc.
+#define SLEEPTIME 292           //Time for Wifi to stay asleep (5 minutes (300 secs) minus tiem to connect (approx 8s)
+#define CALCCOUNT 24            //Number of tick loops for Calculations 24 x 5 = 2 minutes
+#define PUBCOUNT 30             //Number of tick loops for Publishing 30 x 5 = 2.5 minutes
+#define PRESCOMP 1.0333         //Pressure Compensation for altitude of 286m
+#define PRESCONV 3386.39        //Convert Pascals to inches of Mercury
+#define BLINKTIME 100           //LED Blink time (ms) during sleep
+
+// Set up variables
+int led1 = D7;                  //pin for on board LED to signal Sleep Mode
+int signal = 0;                 //WiFi signal
+long lastWindCheck = 0;
+double max_temp = 0;            //max temp for the sample period
+double min_temp = 0;            //min temp for the sample period
+double cum_temp = 0;            //sum of temp over sample period
+double avg_temp = 0;            //average temp (cum_temp/samples)
+double mov_avg_temp  = 0;       //Moving Average Temp
+double mov_avg_pres  = 0;      //Moving Average Pressure
+double mov_avg_volts = 0;       //Moving Average battery voltage
+double mov_avg_wind = 0;
+double mov_avg_dir = 0;
+double humidity = 0;            //Humitidy
+double tempF = 0;               //temperature in F
+double baroPress = 0;           //Pressure in Pascals
+double baroINHg = 0;            //Pressure in inchess of mercury 
+double baroTemp = 0;            //Tempt of pressure sensor
+double battVolts = 0;           //Saled battery voltage
+double windDirection = 0;
+double currentSpeed = 0;
+
+
+// Set up flags for loop control
+bool sleeping = false;          //True if WiFi is sleeping (offline)
+bool sleep_allowed = false;     //True if the WiFi should go to sleep
+bool read_sensors = false;      //True if we should read the sensors
+bool perform_calcs = false;     //True if we should perform the calculations
+bool publish_data = false;      //True if we should publish the data to the cloud
+bool sleep_start = false;       //True if we should put the WiFi to bed
+bool active = false;
+
+// Counters for loops
+int count = 0;                  //Tick Counter - manily for debug and serial print
+int calc_count = 0;             //Calculation Counter - period between performing calculations
+int publish_count = 0;          //Publish Counter - period between publishing data
+int avg_count = 0;              //number of samples for average calculation
+int analogPin1 = A1;
+int analogPin2 = A2;             //Analog input for battery voltage
+int digital5 = D5;
+int analogBatt = 0;                    //Value for battery voltage
+int analogWind = 0;
+
+//Interrupt Variables
+volatile long lastWindIRQ = 0;
+volatile int windClicks = 0;
+
+
+
+// String Variables
+String dateutc = "now";
+
+//Char Variables
+char data[256];
+char debug[256];
+char id[24] = "KMNMINNE410";
+char pwd[] = "l0ngwall";
+char date[24] = "now";
+
+uint32_t RGB_COLOR_OFF = 0x00000000; 
+
+// Set up timers
+Timer tick(TICKTIME, main_loop_timer);  //This is the main loop timer calling funtion main_loop_timer
+Timer awake(AWAKETIME, wifi_sleep);     //This is the awake timer calling function wifi_sleep  
+Timer ledBlink(BLINKTIME, led_off);     //This is the LED blink time timer 
+
+//Create Instance of HTU21D or SI7021 temp and humidity sensor and MPL3115A2 barometric sensor
+Weather sensor;
+
+//------------------------------------------------------------------------------------
+// Setup 
+//------------------------------------------------------------------------------------
+void setup()
+{
+    pinMode(led1, OUTPUT);                       //Set up on board led as output
+    pinMode(digital5, INPUT_PULLUP);             // input from Davis Annemomenter windspeed sensor
+    Particle.function("SleepMode", sleepMode);   //This function controls wewther the WiFi should be allowed to sleep of not
+    Particle.variable("Sig", signal);            //Expose the raw wifi signal value
+    Particle.variable("Humidity", humidity);     //Expose the humidity variable
+    Particle.variable("Temp", tempF);           //Expose the temperature variable
+    Particle.variable("Pressure", baroPress);    //Expose the pressure variable
+    Particle.variable("TempBaro", baroTemp);     //Expose the pressure sensor temperature variable
+    Particle.variable("BattVolts", battVolts);     //Expose the battery voltage
+    Particle.variable("WindDir", windDirection);
+    Particle.variable("WindSpeed", currentSpeed);
+    Particle.subscribe("yerrinbool", resetHandler);  //Subcribe to reset commands
+    attachInterrupt(digital5, windSpeedIRQ, FALLING);  //Set up D5 as an interrupt 
+    interrupts();                                       //Enable Interrupts
+    sensor.begin();                              //Initialize the I2C sensors and ping them
+    sensor.setModeBarometer();                   //Set to Barometer Mode
+    sensor.setOversampleRate(7);                 // Set Oversample rate
+    sensor.enableEventFlags();                   //Necessary register calls to enble temp, baro and alt
+    Serial.begin(9600);                          //Begin Serial comms for debugging
+    tick.start();                                //Start the main loop timer
+    LEDSystemTheme sleepTheme;
+    sleepTheme.setColor(LED_SIGNAL_NETWORK_OFF, RGB_COLOR_OFF);
+    sleepTheme.apply();
+}
+
+//------------------------------------------------------------------------------------
+//  Main Loop
+//------------------------------------------------------------------------------------
+//The loop is split into sections that are controlled by the loop flags, 
+//which are set true by the tick timer
+//and set false once that section of code runs, waiting for next timer event
+//------------------------------------------------------------------------------------
+void loop()
+{
+    // This section reads the sensors 
+   if ( read_sensors ) 
+   {
+        read_sensors = false;               //Reset the control flag
+//        Serial.println("Reading Signal");   //For debugging
+        signal = WiFi.RSSI();               //get the WiFi signal
+        analogBatt = analogRead(analogPin2);        //Read A1 for battery voltage
+        battVolts = analogBatt / 183.7;
+        analogWind = analogRead(analogPin1);
+        windDirection = (float)analogWind * 360 / 4096;
+        currentSpeed = get_wind_speed();
+        
+//        Serial.print("Value: ");
+//        Serial.println(val);
+        getWeather();
+        cum_temp = cum_temp + baroTemp;       //accumulate for average calculation
+        avg_count++;                       //Increment avergage sample counter
+        if ( count <= CALCCOUNT ) {
+              mov_avg_temp -= mov_avg_temp / count; //subtract one value of moving agerage 
+              mov_avg_temp += baroTemp / count;     //Add the latest reading 
+              mov_avg_pres -= mov_avg_pres / count; //subtract one value of moving agerage 
+              mov_avg_pres += baroPress / count;     //Add the latest reading 
+              mov_avg_volts -= mov_avg_volts / count; //subtract one value of moving agerage 
+              mov_avg_volts += battVolts / count;     //Add the latest reading 
+              mov_avg_wind -= mov_avg_wind / count; //subtract one value of moving agerage 
+              mov_avg_wind += currentSpeed / count;     //Add the latest reading 
+              mov_avg_dir -= mov_avg_dir / count; //subtract one value of moving agerage 
+              mov_avg_dir += windDirection / count;     //Add the latest reading 
+           } else {
+              mov_avg_temp -= mov_avg_temp / CALCCOUNT;     //Subtract one value of moving average
+              mov_avg_temp += baroTemp / CALCCOUNT;         //Add the latest reading
+              mov_avg_pres -= mov_avg_pres / CALCCOUNT;     //Subtract one value of moving average
+              mov_avg_pres += baroPress / CALCCOUNT;         //Add the latest reading
+              mov_avg_volts -= mov_avg_volts / CALCCOUNT;       //subtract one value of moving agerage 
+              mov_avg_volts += battVolts / CALCCOUNT;           //Add the latest reading 
+              mov_avg_wind -= mov_avg_wind / CALCCOUNT; //subtract one value of moving agerage 
+              mov_avg_wind += currentSpeed / CALCCOUNT;     //Add the latest reading 
+              mov_avg_dir -= mov_avg_dir / CALCCOUNT; //subtract one value of moving agerage 
+              mov_avg_dir += windDirection / CALCCOUNT;     //Add the latest reading 
+        }
+        if ( baroTemp > max_temp )          //Get the min and max values over the sample period
+        {
+            max_temp = baroTemp;
+        }
+        if ( baroTemp < min_temp ) 
+        {
+            min_temp = baroTemp;
+        }
+        digitalWrite(led1,HIGH);                //Flash the LED to indicate alive
+        ledBlink.start();                       //Start the ledBlink timer to turn off the led
+//        Serial.print("Humidity= ");            //For debugging
+//        Serial.println(humidity);
+//        Serial.print("Temp (F)= ");            //For debugging
+//        Serial.println(tempF);
+//        Serial.print("Pressure: ");            //For debugging
+//        Serial.println(baroPress);
+   }
+   // This section performs the calculations
+   if ( perform_calcs ) 
+   {
+       perform_calcs = false;                   //Reset the control flag
+       avg_temp = cum_temp / avg_count;         //Calculate the average value 
+//       mov_avg_pres = mov_avg_pres * PRESCOMP;        //Adjust for altitude
+       baroINHg = mov_avg_pres / PRESCONV * PRESCOMP;         //Convert from pascals to inches of mercury and adjust for altitude
+//       Serial.print("Average Temp: ");        //For debugging
+//       Serial.println(avg_temp);              //For debugging
+//       Serial.print("Max Temp: ");            //For debugging
+//       Serial.println(max_temp);              //For debugging
+//       Serial.print("Mim Temp: ");            //For debugging
+//       Serial.println(min_temp);              //For debugging
+        dateutc = Time.format(Time.now(), "%Y-%m-%d+%H:%M:%S");  //Build the date
+        dateutc.replace(":", "%3A");                //HTML escape the : symbol with '%3A'
+//        Serial.print("Date String: ");            //For Debugging
+//        Serial.println(dateutc);                  //For Debugging
+        dateutc.toCharArray(date, sizeof(date));    //copy the string to a char array for use in snprintf
+        cum_temp = 0;                               //Reset the temp accumulator
+        calc_count = 0;                             //Reset the loop counter for the calculations
+        avg_count = 0;                              //Reset average counter
+   }    
+   // This section publishes the data to the cloud
+   if ( ( publish_data ) && ( WiFi.ready() ) )      //Make sure the WiFi is ready before trying to publish
+   {
+        publish_data = false;                                   //Reset the control flag
+        sleeping = false;                                       //If the WiFI is ready, then it's not sleeping
+        publish_count = 0;                                      //Reset the loop counter
+        build_data();                                           //Build the data string 
+        build_debug();                                          //Build the debug string
+//        Particle.publish("Temp",String(baroTemp),60,PRIVATE);   //Publish the temperature
+        Particle.publish("Debug",debug,60,PRIVATE);             //Publish debugging information
+        Particle.publish("Wunderground",data,60,PRIVATE);       //Publish the weather data for the webhook
+        Particle.publish("Batt Volts", String(mov_avg_volts), 60, PRIVATE);
+      if ( ( !sleeping ) && ( sleep_allowed ) )                 //Once Publishing is complete, put WiFi to sleep 
+      {
+          awake.start();                                        //Start the awake timer. 
+          //This keeps the WiFi alive long enough to allow commands and flash
+      }
+   }
+   // This section triggers sleep mode after the awake timer completes
+   if ( ( sleep_start ) && ( sleep_allowed ) )               
+   {
+       sleep_start = false;             //Reset the control flag
+       sleeping = true;                 //Set flag to indicate the WiFi is sleeping
+       System.sleep(SLEEPTIME);         //Go To Sleep!    
+   }
+}
+
+//-------------------------------------------------------------------------------------------------
+// Functions
+//-------------------------------------------------------------------------------------------------
+// This function controls weather the WiFI is allowed to go into sleep mode. 
+// It sets the varaible sleep_allowed. If TRUE - sleep is allowed, If FALSE - sleep not allowed 
+// Main purpose for this is to keep the WiFi active so that new firmwared can be flashed easily. 
+int sleepMode(String command) 
+{
+    if (command=="on")              // Command from cloud is on
+    {
+        sleep_allowed = TRUE;       //Set flag to allow WiFi to sleep
+        Particle.publish("SleepMode","on",60,PRIVATE);  //Publish the sleep mode to the cloud
+        return 1;                   //Return variable for the function
+    } 
+    else if (command=="off")        // Command from cloud is off
+    {
+        sleep_allowed = FALSE;      //Set falg to prevent WiFi from sleeping
+        Particle.publish("SleepMode","off",60,PRIVATE); //Punlish the sleep mode to the cloud
+        return 0;                   //Return verialble for the function
+    }
+    else 
+    {
+        return -1;                  //command was not valid, return -1 as error condition
+    }
+}
+
+// This function is the main loop timer - keep this short and sweet so as not to block other code
+void main_loop_timer()
+{
+    count++;                            //Loop counter (mainly for debugging)    
+    calc_count++;                       //Loop counter for Calculation Section
+    publish_count++;                    //Loop counter for Pubishing Section
+    read_sensors = true;                //Set the read sensors flag every time through the loop
+//    Serial.print("Timer Count = ");     //For debugging 
+//    Serial.println(count);              //For debugging 
+    Serial.println(Time.timeStr());     //For debugging 
+    if ( calc_count == CALCCOUNT)       //Set the calcuation flag after CALCCOUNT times
+    {     
+        perform_calcs = true;
+    }
+    if ( publish_count == PUBCOUNT )    //Set the publishing flag after PUNCOUNT times
+    {  
+        publish_data = true;
+    }
+}
+
+// This function is called after the awake timer expires - keep this short and sweet
+void wifi_sleep()
+{
+    sleep_start = true;                         //Set the start_sleep control flag for main loop
+    awake.stop();                               //Stop the awake timer - restart from main loop
+}
+
+//This function reads the weather sensors-
+void getWeather()
+{
+  humidity = sensor.getRH();            // Measure Relative Humidity from the HTU21D or Si7021
+  tempF = sensor.getTempF();            // Measure Temperature from the HTU21D or Si7021
+  baroTemp = sensor.readBaroTempF();    //Measure the Barometer temperature in F from the MPL3115A2
+  baroPress = sensor.readPressure();    //Measure Pressure from the MPL3115A2
+}
+// Blink the LED while sleeping to reduce power.
+void led_off()          //Time end routine
+{  
+    digitalWrite(led1,LOW);
+    ledBlink.stop();            //Stop the led blink timer.
+}
+
+// Build the data string for Wunderground. 
+void build_data()
+{
+    //Write formatted output to sized buffer data
+    //This creates a char buffer with the name:value pairs passed through the webhook
+    //The name:value pairs are set up to convert to Wunderground format in the webhook
+    //Escape " with \ to print double quotes, i.e. \" prints " inside string
+         snprintf(data, sizeof(data),
+         "{"                        // Prints {
+         "\"id\":\"%s\","           // Prints "id":"KMNMINNE410",
+         "\"pwd\":\"%s\","          // Prints "pwd":"l0ngwall",
+         "\"dateutc\":\"%s\","      // Prints "dateutc":"2017-09-01+13%3A21%3A12",
+         "\"pressure\":\"%.2f\","  // Prints "pressure":"30.18",
+         "\"humidity\":\"%.0f\","  // Prints "humidity":"51.2",
+         "\"temp\":\"%.1f\","           // Prints "temp":"101.2"
+         "\"speed\":\"%.0f\","
+         "\"direction\":\"%.0f\""
+         "}"                        // Prints }
+        ,id
+        ,pwd
+        ,date
+        ,baroINHg
+        ,humidity
+        ,mov_avg_temp
+        ,mov_avg_wind
+        ,mov_avg_dir
+        );
+//        Serial.print("Data String: ");
+//        Serial.println(data);
+}
+
+//Build the debug string
+void build_debug()
+{
+    snprintf(debug, sizeof(debug), 
+    "Volts: %5.2f, Signal: %i, Avg Temp: %4.1f, Mov Avg: %4.1f", battVolts, signal, avg_temp, mov_avg_temp);
+}
+
+// This handler gets called when the Event yerrinbool is received
+void resetHandler(const char *event, const char *data)
+{
+//    Serial.println(Time.timeStr()); 
+//    Serial.print("Event: ");
+//    Serial.println(event);
+//    Serial.print("Data: ");
+//    Serial.println(data);
+    if (strstr(data, "reset"))              //If the data contains the string reset
+    {
+        System.reset();                     //Reset the Photon
+    }
+    if (strstr(data, "sleep"))              //If the dsata contains the string sleep
+    {
+        if ( sleep_allowed == FALSE )       //toggle the sleep mode and publish the result
+        {
+            sleep_allowed = TRUE;
+            Particle.publish("SleepMode","on",60,PRIVATE);
+        } else {
+            sleep_allowed = FALSE;
+            Particle.publish("SleepMode","off",60,PRIVATE);
+        }
+    }
+}
+
+// Interrupt Handler for wind speed
+void windSpeedIRQ()
+// Activated by the magnet in the anemometer, attached to input D5
+{
+  if (millis() - lastWindIRQ > 10) // Ignore switch-bounce glitches less than 10ms  after the reed switch closes
+  {
+    lastWindIRQ = millis(); //Grab the current time
+    windClicks++; //There is 1.492MPH for each click per second.
+  }
+}
+
+// Get wind speed
+float get_wind_speed()
+{
+    float deltaTime = millis() - lastWindCheck; 
+    deltaTime /= 1000.0; //Covert to seconds
+    float windSpeed = (float)windClicks / deltaTime; 
+    windSpeed *= 2.25;   
+    windClicks = 0; //Reset and start watching for new wind
+    lastWindCheck = millis();
+//    Serial.print("Windspeed:");
+//    Serial.println(windSpeed);
+    return(windSpeed);
+}
